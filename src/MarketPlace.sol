@@ -1,0 +1,2051 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.22;
+
+import {UUPSUpgradeable} from "@openzeppelin-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import {Initializable} from "@openzeppelin-upgradeable/proxy/utils/Initializable.sol";
+import {OwnableUpgradeable} from "@openzeppelin-upgradeable/access/OwnableUpgradeable.sol";
+import {AccessControlUpgradeable} from "@openzeppelin-upgradeable/access/AccessControlUpgradeable.sol";
+import {ReentrancyGuardUpgradeable} from "@openzeppelin-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import {Errors} from "./Errors.sol";
+import {console} from "forge-std/console.sol";
+import {SellerIdentity} from "./SellerIdentity.sol";
+
+/**
+ * @title Marketplace
+ * @author ArefXV https://github.com/arefxv
+ * @dev A decentralized marketplace contract supporting product listings, auctions, subscriptions,
+ * loyalty programs, and upgradeable functionality. Implements UUPS upgrade pattern and includes
+ * features for seller management, product categorization, discount coupons, and dispute resolution
+ *
+ * Key Features:
+ * - Seller subscriptions with tiered privileges
+ * - Product collections and categories
+ * - Auction system with bid management
+ * - Discount coupons and loyalty rewards
+ * - Premium subscriptions for buyers
+ * - Support tickets and refund requests
+ * - Upgradeable contract architecture
+ * - Role-based access control
+ * - Product reviews and ratings system
+ * ********************************************************************************************************
+ * ********************************************************************************************************
+ * ********************************************************************************************************
+ * @notice this contract is above the contract size limit,                                                *
+ * so it cannot be deployed,                                                                              *
+ * this is designed solely to showcase various marketplace features and has not been optimized or audited *
+ * ********************************************************************************************************
+ * ********************************************************************************************************
+ * ********************************************************************************************************
+ */
+contract MarketPlace is
+    Initializable,
+    OwnableUpgradeable,
+    UUPSUpgradeable,
+    AccessControlUpgradeable,
+    ReentrancyGuardUpgradeable,
+    Errors
+{
+    /*////////////////////////////////////////////////////
+                            TYPES
+    ////////////////////////////////////////////////////*/
+
+    /**
+     * @dev Seller status enumeration:
+     * - ACTIVE: Seller can perform all actions
+     * - INACTIVE: Seller paused by self or admin
+     * - SUSPENDED: Banned by admin, collections cleared
+     */
+    enum SellerStatus {
+        ACTIVE,
+        INACTIVE,
+        SUSPENDED
+    }
+
+    /**
+     * @dev Represents a seller in the marketplace
+     * @param seller The address of the seller
+     * @param id Unique identifier for the seller
+     * @param subTimestamp Timestamp when the seller's subscription ends
+     * @param isSeller Boolean indicating if the address is registered as a seller
+     */
+    struct Seller {
+        address seller;
+        uint256 id;
+        uint256 subTimestamp;
+        bool isSeller;
+    }
+
+    /**
+     * @dev Represents a product listed in the marketplace
+     * @param productId Unique identifier for the product
+     * @param price Price of the product in USD
+     * @param productDescription Description or metadata of the product
+     * @param soldOut Boolean indicating if the product is sold out
+     * @param couponId ID of the active discount coupon for this product
+     * @param discountedPrice Current discounted price of the product
+     */
+    struct Product {
+        uint256 productId;
+        uint256 price;
+        string productDescription;
+        bool soldOut;
+        uint256 couponId;
+        uint256 discountedPrice;
+        bool forPremiums;
+        address owner;
+    }
+
+    /**
+     * @dev Represents a collection of products
+     * @param owner Address of the collection owner (seller)
+     * @param collectionId Unique identifier for the collection
+     * @param collectionName Name of the collection
+     * @param collectionDescription Description or metadata of the collection
+     * @param productCount Number of products in the collection
+     * @param products Mapping of product IDs to Product structs
+     */
+    struct Collection {
+        address owner;
+        uint256 collectionId;
+        string collectionName;
+        string collectionDescription;
+        uint256 productCount;
+        mapping(uint256 => Product) products;
+    }
+
+    /**
+     * @dev Tracks statistics for a product
+     * @param totalSold Total number of units sold
+     * @param totalRevenue Total revenue generated by the product
+     * @param totalRatings Sum of all ratings received
+     * @param averageRating Average rating of the product
+     */
+    struct ProductStats {
+        uint256 totalSold;
+        uint256 totalRevenue;
+        uint256 totalRatings;
+        uint256 averageRating;
+    }
+
+    /**
+     * @dev Represents an auction for a product
+     * @param seller Address of the seller hosting the auction
+     * @param startPrice Starting price of the auction
+     * @param highestBid Current highest bid amount
+     * @param highestBidder Address of the current highest bidder
+     * @param startTime Timestamp when the auction started
+     * @param duration Duration of the auction in seconds
+     */
+    struct Auction {
+        address seller;
+        uint256 startPrice;
+        uint256 highestBid;
+        address highestBidder;
+        uint256 startTime;
+        uint256 duration;
+        bool finalized;
+    }
+
+    /**
+     * @dev Represents a discount coupon for a product
+     * @param discountPrecentage Percentage discount offered by the coupon
+     * @param expirationTime Timestamp when the coupon expires
+     * @param isUsed Boolean indicating if the coupon has been used
+     */
+    struct DiscountCoupon {
+        uint256 discountPercentage;
+        uint256 expirationTime;
+        bool isUsed;
+    }
+
+    /**
+     * @dev Represents a review for a product
+     * @param reviewer Address of the reviewer
+     * @param rating Rating given by the reviewer (1-5)
+     * @param comment Review comment or feedback
+     * @param timestamp Timestamp when the review was submitted
+     */
+    struct Review {
+        address reviewer;
+        uint256 rating;
+        string comment;
+        uint256 timestamp;
+    }
+
+    /**
+     * @dev Represents a transaction in the marketplace
+     * @param buyer Address of the buyer
+     * @param seller Address of the seller
+     * @param collectionId ID of the collection containing the product
+     * @param productId ID of the purchased product
+     * @param value Amount paid in the transaction
+     * @param timestamp Timestamp when the transaction occurred
+     */
+    struct Transaction {
+        address buyer;
+        address seller;
+        uint256 collectionId;
+        uint256 productId;
+        uint256 value;
+        uint256 timestamp;
+    }
+
+    /**
+     * @dev Represents a support ticket created by a user
+     * @param ticketId Unique identifier for the ticket
+     * @param user Address of the user who created the ticket
+     * @param title Title of the support ticket
+     * @param description Description of the issue
+     * @param emailAddress Email address for follow-up
+     * @param isClosed Boolean indicating if the ticket is closed
+     * @param timestamp Timestamp when the ticket was created
+     */
+    struct SupportTicket {
+        uint256 ticketId;
+        address user;
+        string title;
+        string description;
+        string emailAddress;
+        bool isClosed;
+        uint256 timestamp;
+    }
+
+    /**
+     * @dev Represents a product category
+     * @param categoryId Unique identifier for the category
+     * @param categoryName Name of the category
+     * @param productIds Array of product IDs belonging to this category
+     */
+    struct Category {
+        uint256 categoryId;
+        string categoryName;
+        uint256[] productIds;
+    }
+
+    /**
+     * @dev Represents a refund request
+     * @param requestId Unique identifier for the request
+     * @param buyer Address of the buyer requesting the refund
+     * @param seller Address of the seller
+     * @param collectionId ID of the collection containing the product
+     * @param productId ID of the product being refunded
+     * @param reason Reason for the refund request
+     * @param isApproved Boolean indicating if the refund is approved
+     * @param timestamp Timestamp when the request was created
+     */
+    struct RefundRequest {
+        uint256 requestId;
+        address buyer;
+        address seller;
+        uint256 collectionId;
+        uint256 productId;
+        string reason;
+        bool isApproved;
+        uint256 timestamp;
+    }
+
+    /**
+     * @dev Represents a notification sent to a user
+     * @param notificationId Unique identifier for the notification
+     * @param message Content of the notification
+     * @param timestamp Timestamp when the notification was sent
+     * @param isRead Boolean indicating if the notification has been read
+     */
+    struct Notification {
+        address sender;
+        address receiver;
+        uint256 notificationId;
+        string message;
+        uint256 timestamp;
+    }
+
+    /**
+     * @dev Represents loyalty rewards for a user
+     * @param points Total loyalty points earned
+     * @param lastPurchaseTimestamp Timestamp of the user's last purchase
+     */
+    struct LoyaltyReward {
+        uint256 points;
+        uint256 lastPurchaseTimestamp;
+    }
+
+    /**
+     * @dev Represents a premium subscription for a user
+     * @param user Address of the subscribed user
+     * @param startTimestamp Timestamp when the subscription started
+     * @param endTimestamp Timestamp when the subscription ends
+     */
+    struct PremiumSubscription {
+        address user;
+        uint256 startTimestamp;
+        uint256 endTimestamp;
+    }
+
+    /**
+     * @dev represents sold item details
+     * @param seller Seller address
+     * @param eanedValue Amount earned from sale
+     * @param soldTime Time of sale
+     * @param lockUpTime Funds unlock time
+     */
+    struct SoldItems {
+        address seller;
+        uint256 earnedValue;
+        uint256 soldTime;
+        uint256 lockUpTime;
+    }
+
+    /**
+     * @dev Struct for product update data
+     * @param collectionOwner Collection owner address
+     * @param collectionId Collection ID
+     * @param productId Product ID
+     * @param newPrice Updated price
+     * @param newDescription Updated description
+     */
+    struct ProductUpdateData {
+        address collectionOwner;
+        uint256 collectionId;
+        uint256 productId;
+        uint256 newPrice;
+        string newDescription;
+    }
+
+    /**
+     * @dev Struct for purchase information
+     * @param seller Seller address
+     * @param collectionId Collection ID
+     * @param productId Product ID
+     * @param price Purchase price
+     */
+    struct PurchaseInfo {
+        address seller;
+        uint256 collectionId;
+        uint256 productId;
+        uint256 price;
+    }
+
+    /**
+     * @dev Struct for purchase data
+     * @param seller Seller address
+     * @param collectionId Collection ID
+     * @param productId Product ID
+     * @param couponId Applied coupon ID
+     */
+    struct PurchaseData {
+        address seller;
+        uint256 collectionId;
+        uint256 productId;
+        uint256 couponId;
+    }
+
+    /**
+     * @dev Struct for refund data
+     * @param seller Seller address
+     * @param buyer Buyer address
+     * @param requestId Refund request ID
+     * @param productId Product ID
+     * @param collectionId Collection ID
+     * @param value Refund amount
+     */
+    struct RefundData {
+        address seller;
+        address buyer;
+        uint256 requestId;
+        uint256 productId;
+        uint256 collectionId;
+        uint256 value;
+    }
+
+    /*////////////////////////////////////////////////////
+                            CONSTANTS
+    ////////////////////////////////////////////////////*/
+
+    uint256 private constant SELLER_SOLD_ITEM_LOCKUP = 7 days;
+    uint256 private constant SELLER_END_SUB = 365 days;
+    uint256 private constant PREMIUM_SUBSCRIPTION_END = 365 days;
+    uint256 private constant SUB_CANCELLATION_DEADLINE = 7 days;
+    uint256 private constant PRECISION = 100;
+    uint256 private constant MAX_AUCTION_DURATION = 14 days;
+    uint256 private constant ADDITIONAL_FEED_PRECISION = 1e10;
+    uint256 private constant MIN_RATING = 1;
+    uint256 private constant MAX_RATING = 5;
+    bytes32 private constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+
+    /*////////////////////////////////////////////////////
+                        STATE VARIABLES
+    ////////////////////////////////////////////////////*/
+
+    uint256 private s_sellerId;
+    uint256 private s_collectionCounter;
+    uint256 private s_platformRevenue;
+    uint256 private s_couponCounter;
+    uint256 private s_ticketCounter;
+    uint256 private s_categoryCounter;
+    uint256 private s_notificationCounter;
+    uint256 private s_refundRequestCounter;
+    uint256 private s_sellerSubscriptionCharge;
+    uint256 private s_premiumSubscriptionFee;
+    uint256 private s_platformPercentage;
+    uint256 private s_ethValueToPoint;
+    uint256 private s_requiredDiscountPoints;
+    uint256 private s_premiumUsersDiscountPercentage;
+    uint256 private s_loyalCustomerDiscountPercentage;
+
+    SellerStatus private sellerStatus;
+    SellerIdentity private s_sellerIdentity; //Reference to the SellerIdentity contract
+
+    /*/////////////////
+    Core Mappings
+    /////////////////*/
+    mapping(address => Seller) private s_sellers; // seller addresses to their Seller profiles
+    mapping(address => Collection[]) private s_collections; // sellers to their product collections
+    mapping(address => SellerStatus) private s_sellerStatus; //Tracks the status of each seller
+    mapping(address => uint256) private s_sellerEarnings; //Tracks earnings per seller
+    mapping(uint256 => uint256) private s_productSales; //Tracks units sold per product ID
+    mapping(address => SoldItems) private s_soldItems;
+
+    /*/////////////////
+    Financial Mappings
+    /////////////////*/
+    mapping(address => uint256) private s_pendingWithdrawals; //Tracks ETH withdrawal balances for users
+    mapping(address => uint256) private s_pendingBidRefunds; //ETH bid refund amounts for users
+
+    /*/////////////////
+    Product Management
+    /////////////////*/
+    mapping(address => mapping(uint256 => mapping(uint256 => ProductStats))) private s_productStats; //sales and rating statistics per product
+    mapping(address => mapping(uint256 => mapping(uint256 => Auction))) private s_auctions; //Stores active auctions per product
+    mapping(uint256 => DiscountCoupon) private s_discountCoupons; //Stores discount coupon details
+    mapping(address => mapping(uint256 => mapping(uint256 => address[]))) private s_productBuyers; //Tracks buyers for each product
+    mapping(address => mapping(uint256 => mapping(uint256 => Review[]))) private s_productReviews; //Stores product reviews
+
+    /*/////////////////
+    User Data
+    /////////////////*/
+    mapping(address => Transaction[]) private s_userTransactions; //purchase history per user
+    mapping(address => SupportTicket[]) private s_userTickets; //support tickets per user
+    mapping(address => Category[]) private s_userCategories; //product categories per seller
+    mapping(address => Notification[]) private s_userNotifications; //notifications per user
+
+    /*/////////////////
+    Access Control
+    /////////////////*/
+    mapping(address => mapping(uint256 => SupportTicket)) private s_userTicketsMap; //ticket IDs to SupportTicket structs
+    mapping(address => mapping(uint256 => RefundRequest)) private s_userRefundRequestsMap; //refund request IDs to RefundRequest structs
+    mapping(address => LoyaltyReward) private s_loyaltyRewards; //loyalty points per user
+    mapping(address => PremiumSubscription) private s_premiumSubscriptions; //premium subscription status per user
+    mapping(address => mapping(uint256 categoryId => Category)) private s_userCategoriesMap;
+    mapping(address => mapping(uint256 => mapping(uint256 => mapping(address => bool)))) private s_productBuyersMap;
+    mapping(address => mapping(uint256 => mapping(uint256 => bool))) private s_activeAuctions; //active auctions per product
+
+    /*////////////////////////////////////////////////////
+                             EVENTS
+    ////////////////////////////////////////////////////*/
+
+    event AdminRoleGrant(address admin);
+    event RefundApproved(address buyer, uint256 requestId);
+    event AdminInactivatedSeller(address seller);
+    event AdminActivatedSeller(address seller);
+    event AdminSuspendedSeller(address seller);
+    event SellerSubscribed(address seller, uint256 sellerId, uint256 subscriptionTime);
+    event SubscriptionCancelled(address seller);
+    event FundsWithdrawn(address user, uint256 value);
+    event CollectionDescriptionUpdated(address seller, uint256 collectionId, string newDescription);
+    event SellerInactivatedStatus(address seller);
+    event SellerActivatedStatus(address seller);
+    event CategoryCreated(address seller, uint256 categoryId, string categoryName);
+    event SubscriptionRenewed(address seller);
+    event CollectionCreated(address seller, string collectionName, string collectionDescription, uint256 collectionId);
+    event ProductListed(address seller, uint256 collectionId, uint256 productId);
+    event ProductUpdated(
+        address seller, uint256 collectionId, uint256 productId, uint256 newPrice, string newDescription
+    );
+    event ProductRemoved(address seller, uint256 collectionId, uint256 productId);
+    event ProductMarkedAsSoldOut(address seller, uint256 collectionId, uint256 productId, bool soldOut);
+    event DiscountCouponCreated(
+        address seller, uint256 collectionId, uint256 productId, uint256 discountPercentage, uint256 expirationTime
+    );
+    event AuctionCreated(address seller, uint256 collectionId, uint256 productId, uint256 startPrice, uint256 duration);
+    event ProductPurchased(address buyer, address seller, uint256 collectionId, uint256 productId, uint256 value);
+    event BidPlaced(address bidder, address seller, uint256 collectionId, uint256 productId);
+    event BidRefunded(address to, uint256 value);
+    event DiscountCouponApplied(address seller, uint256 collectionId, uint256 productId, uint256 couponid);
+    event ReviewSubmitted(
+        address reviewer, address seller, uint256 collectionId, uint256 productId, uint256 rating, string comment
+    );
+    event SupportTicketCreated(address by, uint256 time, uint256 ticketId);
+    event SupportTicketClosed(uint256 ticketId);
+    event NotificationSent(address from, address to);
+    event RefundRequested(address by, address seller, uint256 collectionId, uint256 productId);
+    event LoyaltyPointsAdded(address user, uint256 points);
+    event PremiumSubscriptionPurchased(address user, uint256 fee);
+    event ProductAddedToCategory(address seller, uint256 collectionId, uint256 productId, uint256 categoryId);
+    event SellerSubscriptionFeeChanged(uint256 newFee);
+    event PremiumSubscriptionFeeChanged(uint256 newFee);
+    event PlatformPercentageChanged(uint256 newPercentage);
+    event AuctionFinalized(
+        address seller, uint256 collectionId, uint256 productId, address highestBidder, uint256 highestBid
+    );
+    event RefundRejected(address buyer, uint256 requestId);
+    event LoyaltyDiscountApplied(address user, uint256 discountAmount);
+
+    /*////////////////////////////////////////////////////
+                            MODIFIERS
+    ////////////////////////////////////////////////////*/
+
+    /**
+     * @dev Ensures the payment matches the required amount
+     * @param value The amount sent in the transaction
+     */
+    modifier validValue(uint256 value) {
+        if (value != s_sellerSubscriptionCharge) {
+            revert MarketPlace__InvalidChargeAmount(s_sellerSubscriptionCharge);
+        }
+        _;
+    }
+
+    /**
+     * @dev Ensures the input amount is greater than zero
+     * @param value The amount to validate
+     */
+    modifier moreThanZero(uint256 value) {
+        if (value == 0) {
+            revert MarketPlace__AmountMustBeMoreThanZero();
+        }
+        _;
+    }
+
+    /**
+     * @dev Restricts access to verified and non-suspended sellers
+     */
+    modifier onlyVerifiedAndNonSuspendedSellers() {
+        if (!s_sellerIdentity.isSellerVerified(msg.sender)) {
+            revert MarketPlace__SellerNotVerified();
+        }
+
+        if (s_sellerStatus[msg.sender] == SellerStatus.SUSPENDED) {
+            revert MarketPlace__YourAccountIsSuspended();
+        }
+        _;
+    }
+
+    /**
+     * @dev Restricts access to valid sellers with active subscriptions
+     */
+    modifier onlyValidSellers() {
+        if (!s_sellerIdentity.isSellerVerified(msg.sender)) {
+            revert MarketPlace__SellerNotVerified();
+        }
+
+        if (s_sellers[msg.sender].subTimestamp < block.timestamp) {
+            revert MarketPlace__SubscriptionExpired(s_sellers[msg.sender].subTimestamp);
+        }
+
+        if (s_sellerStatus[msg.sender] == SellerStatus.INACTIVE) {
+            revert MarketPlace__YourAccountIsInactivated();
+        }
+
+        if (s_sellerStatus[msg.sender] == SellerStatus.SUSPENDED) {
+            revert MarketPlace__YourAccountIsSuspended();
+        }
+        _;
+    }
+
+    /**
+     * @dev Ensures the product ID is valid.
+     * @param seller The seller's address.
+     * @param collectionId The collection ID.
+     * @param productId The product ID to validate.
+     */
+    modifier onlyValidProductId(address seller, uint256 collectionId, uint256 productId) {
+        uint256 index = collectionId - 1;
+        Collection storage collection = s_collections[seller][index];
+        if (productId == 0 || productId > collection.productCount) {
+            revert MarketPlace__InvalidProductId();
+        }
+        _;
+    }
+
+    /**
+     * @dev Ensures the collection exists.
+     * @param seller The seller's address.
+     * @param collectionId The collection ID to validate.
+     */
+    modifier onlyExistCollection(address seller, uint256 collectionId) {
+        Collection[] storage collections = s_collections[seller];
+        if (collectionId == 0 || collectionId > collections.length) {
+            revert MarketPlace__CollectionNotFound();
+        }
+        _;
+    }
+
+    /**
+     * @dev Ensures the caller is the owner of the collection.
+     * @param seller The seller's address.
+     * @param collectionId The collection ID.
+     */
+    modifier onlyCollectionOwner(address seller, uint256 collectionId) {
+        Collection[] storage collections = s_collections[seller];
+        uint256 index = collectionId - 1;
+
+        if (s_collections[seller][index].owner != msg.sender) {
+            revert MarketPlace__YouAreNotCollectionOwner();
+        }
+        _;
+    }
+
+    /*////////////////////////////////////////////////////
+                             FUNCTIONS
+    ////////////////////////////////////////////////////*/
+
+    /**
+     * @dev Initialize the marketplace contract
+     * @param sellerIdentity Address of SellerIdentity contract
+     * @notice Sets up initial roles and dependencies, initializes state variables, and grants admin roles to the owner
+     */
+    function initialize(address sellerIdentity) public initializer {
+        __Ownable_init(msg.sender);
+        __UUPSUpgradeable_init();
+        __AccessControl_init();
+
+        s_sellerIdentity = SellerIdentity(sellerIdentity);
+
+        _grantRole(DEFAULT_ADMIN_ROLE, owner());
+        _grantRole(ADMIN_ROLE, owner());
+
+        s_sellerId = 0;
+        s_collectionCounter = 0;
+        s_platformRevenue = 0;
+        s_couponCounter = 0;
+        s_ticketCounter = 0;
+        s_categoryCounter = 0;
+        s_notificationCounter = 0;
+        s_refundRequestCounter = 0;
+        s_premiumUsersDiscountPercentage = 10;
+        s_sellerSubscriptionCharge = 0.01 ether;
+        s_premiumSubscriptionFee = 0.1 ether;
+        s_platformPercentage = 5;
+        s_ethValueToPoint = 0.1 ether;
+        s_requiredDiscountPoints = 100;
+        s_loyalCustomerDiscountPercentage = 15;
+    }
+
+    /*////////////////////////////////////////////////////
+                    EXTERNAL SELLER FUNCTIONS
+    ////////////////////////////////////////////////////*/
+
+    /**
+     * @dev Subscribe as a verified seller
+     * @notice Requires payment of the subscription fee and valid seller verification
+     */
+    function subscribeAsSeller()
+        external
+        payable
+        onlyVerifiedAndNonSuspendedSellers
+        validValue(msg.value)
+        returns (uint256 sellerId)
+    {
+        if (s_sellers[msg.sender].isSeller) {
+            revert MarketPlace__AlreadyRegistered();
+        }
+
+        s_sellerId++;
+
+        s_sellers[msg.sender] =
+            Seller({seller: msg.sender, id: s_sellerId, subTimestamp: block.timestamp + SELLER_END_SUB, isSeller: true});
+
+        emit SellerSubscribed(msg.sender, s_sellerId, block.timestamp + SELLER_END_SUB);
+        s_sellerStatus[msg.sender] = SellerStatus.ACTIVE;
+
+        return sellerId = s_sellerId;
+    }
+
+    /**
+     * @dev Cancel a seller's subscription
+     * @notice Only valid sellers can call this function
+     */
+    function cancelSubscription() external onlyValidSellers {
+        if (block.timestamp > s_sellers[msg.sender].subTimestamp - (SELLER_END_SUB - SUB_CANCELLATION_DEADLINE)) {
+            revert MarketPlace__DeadlinePassed();
+        }
+
+        delete s_sellers[msg.sender];
+        delete s_sellerStatus[msg.sender];
+        delete s_collections[msg.sender];
+
+        s_pendingWithdrawals[msg.sender] += s_sellerSubscriptionCharge;
+        emit SubscriptionCancelled(msg.sender);
+    }
+
+    /**
+     * @dev Renew a seller's subscription
+     * @notice Requires payment of the subscription fee
+     */
+    function renewSubscription() external payable onlyVerifiedAndNonSuspendedSellers validValue(msg.value) {
+        if (s_sellerStatus[msg.sender] == SellerStatus.INACTIVE) {
+            revert MarketPlace__YourAccountIsInactivated();
+        }
+
+        if (block.timestamp < s_sellers[msg.sender].subTimestamp) {
+            revert MarketPlace__SubscriptionNotExpired();
+        }
+
+        if (!s_sellers[msg.sender].isSeller) {
+            revert MarketPlace__NotSubscribedYet__TrySubscribeAsSeller();
+        }
+
+        s_sellers[msg.sender].subTimestamp += SELLER_END_SUB;
+        emit SubscriptionRenewed(msg.sender);
+    }
+
+    /**
+     * @dev Inactivate a seller's status
+     * @notice Only valid sellers can call this function
+     */
+    function inactivateSellerStatus() external onlyValidSellers {
+        s_sellerStatus[msg.sender] = SellerStatus.INACTIVE;
+        emit SellerInactivatedStatus(msg.sender);
+    }
+
+    /**
+     * @dev Activate a seller's status
+     * @notice Only verified and non-suspended sellers can call this function
+     */
+    function activateSellerStatus() external onlyVerifiedAndNonSuspendedSellers {
+        if (s_sellerStatus[msg.sender] == SellerStatus.ACTIVE) {
+            revert MarketPlace__StatusAlreadyActivated();
+        }
+
+        s_sellerStatus[msg.sender] = SellerStatus.ACTIVE;
+        emit SellerActivatedStatus(msg.sender);
+    }
+
+    /**
+     * @dev Create a new product category
+     * @param categoryName Name of the new category
+     * @notice Only valid sellers can call this function
+     */
+    function createCategory(string memory categoryName) external onlyValidSellers {
+        s_categoryCounter++;
+        uint256 newCategoryId = s_categoryCounter;
+
+        s_userCategoriesMap[msg.sender][newCategoryId] =
+            Category({categoryId: newCategoryId, categoryName: categoryName, productIds: new uint256[](0)});
+
+        s_userCategories[msg.sender].push(
+            Category({categoryId: newCategoryId, categoryName: categoryName, productIds: new uint256[](0)})
+        );
+
+        emit CategoryCreated(msg.sender, newCategoryId, categoryName);
+    }
+
+    /**
+     * @dev Creates a new product collection
+     * @param collectionName Name of the collection
+     * @param collectionDescription Description of the collection
+     * @return New collection ID
+     * @notice Only callable by valid sellers
+     */
+    function createCollection(string memory collectionName, string memory collectionDescription)
+        external
+        onlyValidSellers
+        returns (uint256)
+    {
+        Collection[] storage collections = s_collections[msg.sender];
+
+        uint256 newCollectionId = collections.length + 1;
+        collections.push();
+        Collection storage newCollection = collections[collections.length - 1];
+        newCollection.owner = msg.sender;
+        newCollection.collectionId = newCollectionId;
+        newCollection.collectionName = collectionName;
+        newCollection.collectionDescription = collectionDescription;
+        newCollection.productCount = 0;
+
+        emit CollectionCreated(msg.sender, collectionName, collectionDescription, newCollectionId);
+        return newCollectionId;
+    }
+
+    /**
+     * @dev Updates collection description
+     * @param collectionOwner Owner of the collection
+     * @param collectionId ID of the collection to update
+     * @param newDescription New description text
+     * @notice Only callable by collection owner
+     */
+    function updateCollectionDescription(address collectionOwner, uint256 collectionId, string memory newDescription)
+        external
+        onlyValidSellers
+        onlyExistCollection(collectionOwner, collectionId)
+        onlyCollectionOwner(collectionOwner, collectionId)
+    {
+        Collection[] storage collections = s_collections[collectionOwner];
+
+        uint256 index = collectionId - 1;
+
+        collections[index].collectionDescription = newDescription;
+        emit CollectionDescriptionUpdated(collectionOwner, collectionId, newDescription);
+    }
+
+    /**
+     * @dev Lists a new product in a collection
+     * @param collectionId ID of the collection to add product to
+     * @param price Initial product price in wei
+     * @param description Product description
+     * @param forPremiums Whether product is for premium users only
+     * @return productId Assigned product ID
+     * @notice Only callable by valid sellers
+     * @notice Price must be greater than zero
+     */
+    function listProduct(uint256 collectionId, uint256 price, string calldata description, bool forPremiums)
+        external
+        onlyValidSellers
+        moreThanZero(price)
+        onlyExistCollection(msg.sender, collectionId)
+        returns (uint256 productId)
+    {
+        Collection[] storage collections = s_collections[msg.sender];
+        uint256 index = collectionId - 1;
+
+        Collection storage collection = collections[index];
+        uint256 newProductId = collection.productCount + 1;
+        if (forPremiums) {
+            collection.products[newProductId] = Product(newProductId, price, description, false, 0, 0, true, msg.sender);
+        } else {
+            collection.products[newProductId] =
+                Product(newProductId, price, description, false, 0, 0, false, msg.sender);
+        }
+        collection.productCount++;
+        emit ProductListed(msg.sender, collectionId, newProductId);
+
+        return productId = newProductId;
+    }
+
+    /**
+     * @dev Adds product to a category
+     * @param collectionId Collection ID of product
+     * @param productId Product ID to add
+     * @param categoryId Category ID to add to
+     * @notice Only callable by valid sellers
+     */
+    function addProductToCategory(uint256 collectionId, uint256 productId, uint256 categoryId)
+        external
+        onlyValidSellers
+        onlyValidProductId(msg.sender, collectionId, productId)
+    {
+        Category storage category = s_userCategoriesMap[msg.sender][categoryId];
+        if (category.categoryId == 0) {
+            revert MarketPlace__CategoryNotFound();
+        }
+
+        category.productIds.push(productId);
+        emit ProductAddedToCategory(msg.sender, collectionId, productId, categoryId);
+    }
+
+    /**
+     * @dev Updates product details
+     * @param _data ProductUpdateData struct containing update information
+     * @notice Only callable by product owner
+     */
+    function updateProduct(ProductUpdateData calldata _data)
+        external
+        onlyValidSellers
+        onlyValidProductId(_data.collectionOwner, _data.collectionId, _data.productId)
+    {
+        ProductUpdateData memory data = _data;
+
+        uint256 collectionIndex = _data.collectionId - 1;
+        uint256 productId = _data.productId;
+
+        Product storage product = s_collections[_data.collectionOwner][collectionIndex].products[productId];
+
+        if (product.owner != msg.sender) {
+            revert MarketPlace__YouAreNotProductOwner();
+        }
+
+        product.price = _data.newPrice;
+        product.productDescription = _data.newDescription;
+        emit ProductUpdated(data.collectionOwner, data.collectionId, data.productId, data.newPrice, data.newDescription);
+    }
+
+    /**
+     * @dev Removes product from collection
+     * @param seller Seller address
+     * @param collectionId Collection ID
+     * @param productId Product ID to remove
+     * @notice Only callable by collection owner
+     */
+    function removeProduct(address seller, uint256 collectionId, uint256 productId)
+        external
+        onlyValidSellers
+        onlyValidProductId(seller, collectionId, productId)
+        onlyCollectionOwner(seller, collectionId)
+    {
+        Collection[] storage collections = s_collections[seller];
+        uint256 index = collectionId - 1;
+
+        delete collections[index].products[productId];
+        emit ProductRemoved(seller, collectionId, productId);
+        collections[index].productCount--;
+    }
+
+    /**
+     * @dev Marks product as sold out
+     * @param seller Seller address
+     * @param collectionId Collection ID
+     * @param productId Product ID to mark
+     * @notice Only callable by collection owner
+     */
+    function markProductAsSoldOut(address seller, uint256 collectionId, uint256 productId)
+        external
+        onlyValidSellers
+        onlyValidProductId(seller, collectionId, productId)
+        onlyCollectionOwner(seller, collectionId)
+    {
+        Collection[] storage collections = s_collections[seller];
+        uint256 index = collectionId - 1;
+
+        collections[index].products[productId].soldOut = true;
+        emit ProductMarkedAsSoldOut(seller, collectionId, productId, true);
+    }
+
+    /**
+     * @dev Creates discount coupon for product
+     * @param collectionId Collection ID
+     * @param productId Product ID
+     * @param discountPercentage Discount percentage (0-100)
+     * @param expirationTime Coupon expiration timestamp
+     * @return couponId Generated coupon ID
+     * @notice Only callable by valid sellers
+     */
+    function createDiscountCoupon(
+        uint256 collectionId,
+        uint256 productId,
+        uint256 discountPercentage,
+        uint256 expirationTime
+    ) external onlyValidSellers onlyValidProductId(msg.sender, collectionId, productId) returns (uint256 couponId) {
+        if (discountPercentage == 0 || discountPercentage >= 100) {
+            revert MarketPlace__InvalidDiscountPercentage();
+        }
+
+        if (block.timestamp > expirationTime) {
+            revert MarketPlace__CouponExpired();
+        }
+
+        uint256 index = collectionId - 1;
+        Collection storage collection = s_collections[msg.sender][index];
+
+        s_couponCounter++;
+        s_discountCoupons[s_couponCounter] =
+            DiscountCoupon({discountPercentage: discountPercentage, expirationTime: expirationTime, isUsed: false});
+        emit DiscountCouponCreated(msg.sender, collectionId, productId, discountPercentage, expirationTime);
+        collection.products[productId].couponId = s_couponCounter;
+
+        return couponId = s_couponCounter;
+    }
+
+    /**
+     * @dev Creates new auction for product
+     * @param seller Seller address
+     * @param collectionId Collection ID
+     * @param productId Product ID
+     * @param startPrice Initial bid price
+     * @param duration Auction duration in seconds
+     * @notice Only callable by collection owner
+     * @notice Duration cannot exceed MAX_AUCTION_DURATION
+     */
+    function createAuction(
+        address seller,
+        uint256 collectionId,
+        uint256 productId,
+        uint256 startPrice,
+        uint256 duration
+    ) external onlyValidSellers onlyExistCollection(seller, collectionId) onlyCollectionOwner(seller, collectionId) {
+        if (duration >= MAX_AUCTION_DURATION) {
+            revert MarketPlace__MaxDurationIsFourteenDays();
+        }
+
+        s_auctions[seller][collectionId][productId] = Auction({
+            seller: seller,
+            startPrice: startPrice,
+            highestBid: startPrice,
+            highestBidder: address(0),
+            startTime: block.timestamp,
+            duration: block.timestamp + duration,
+            finalized: false
+        });
+
+        s_activeAuctions[seller][collectionId][productId] = true;
+
+        emit AuctionCreated(seller, collectionId, productId, startPrice, duration);
+    }
+
+    /*////////////////////////////////////////////////////
+                    EXTERNAL USERS FUNCTIONS
+    ////////////////////////////////////////////////////*/
+
+    /**
+     * @dev Purchases premium subscription
+     * @notice Requires exact premium subscription fee payment
+     */
+    function purchasePremiumSubscription() external payable {
+        if (msg.value != s_premiumSubscriptionFee) {
+            revert MarketPlace__InvalidChargeAmount(s_premiumSubscriptionFee);
+        }
+
+        s_premiumSubscriptions[msg.sender] = PremiumSubscription({
+            user: msg.sender,
+            startTimestamp: block.timestamp,
+            endTimestamp: block.timestamp + PREMIUM_SUBSCRIPTION_END
+        });
+
+        emit PremiumSubscriptionPurchased(msg.sender, s_premiumSubscriptionFee);
+    }
+
+    /**
+     * @notice Purchases a product from a seller
+     * @dev The product must not be sold out, and the payment must match the product price
+     * @param purchase PurchaseData struct containing purchase data
+     */
+    function purchaseProduct(PurchaseData calldata purchase)
+        external
+        payable
+        moreThanZero(msg.value)
+        nonReentrant
+        onlyValidProductId(purchase.seller, purchase.collectionId, purchase.productId)
+    {
+        uint256 index = purchase.collectionId - 1;
+        Collection storage collection = s_collections[purchase.seller][index];
+        Product storage product = collection.products[purchase.productId];
+
+        if (product.soldOut) {
+            revert MarketPlace__ProductSoldOut();
+        }
+
+        _applyLoyaltyDiscount(purchase.seller, purchase.collectionId, purchase.productId, msg.sender);
+
+        uint256 price = product.discountedPrice != 0 ? product.discountedPrice : product.price;
+
+        if (product.forPremiums) {
+            if (s_premiumSubscriptions[msg.sender].endTimestamp > block.timestamp) {
+                uint256 premiumDiscount = (product.price * s_premiumUsersDiscountPercentage) / PRECISION;
+
+                product.discountedPrice = product.price - premiumDiscount;
+
+                product.owner = msg.sender;
+                s_productSales[purchase.productId]++;
+                (bool success,) = payable(msg.sender).call{value: premiumDiscount}("");
+                require(success);
+            }
+        }
+
+        if (msg.value != price) {
+            revert MarketPlace__ProductPriceIsDifferent(product.price);
+        }
+
+        PurchaseInfo memory info = PurchaseInfo(purchase.seller, purchase.collectionId, purchase.productId, price);
+
+        _markProductAsBought(info);
+        _updateSalesData(info);
+        _saveTransaction(info);
+
+        emit ProductPurchased(msg.sender, info.seller, info.collectionId, info.productId, info.price);
+        _addLoyaltyPoints(msg.sender, price);
+    }
+
+    /**
+     * @dev Places bid on auction
+     * @param purchaseData PurchaseData struct containing auction details
+     * @notice Bid amount must be higher than current highest bid
+     * @notice Uses nonReentrant modifier
+     */
+    function placeBid(PurchaseData calldata purchaseData)
+        external
+        payable
+        nonReentrant
+        moreThanZero(msg.value)
+        onlyExistCollection(purchaseData.seller, purchaseData.collectionId)
+        onlyValidProductId(purchaseData.seller, purchaseData.collectionId, purchaseData.productId)
+    {
+        PurchaseData memory data = purchaseData;
+        Auction storage auction = s_auctions[data.seller][data.collectionId][data.productId];
+
+        uint256 bidAmount;
+
+        bidAmount = msg.value;
+
+        if (bidAmount <= auction.startPrice) {
+            revert MarketPlace__CannotPlaceBidLowerThanStartPrice(auction.startPrice);
+        }
+
+        if (block.timestamp > auction.duration) {
+            revert MarketPlace__AuctionEnded();
+        }
+
+        if (auction.highestBidder != address(0)) {
+            s_pendingBidRefunds[auction.highestBidder] += auction.highestBid;
+        }
+
+        auction.highestBid = bidAmount;
+        auction.highestBidder = msg.sender;
+
+        emit BidPlaced(msg.sender, data.seller, data.collectionId, data.productId);
+    }
+
+    /**
+     * @notice Requests a refund for a purchased product
+     * @dev The refund request is stored in the user's refund request list
+     * @param purchaseData PurchaseData struct containing purchase data
+     * @param reason The reason for the refund request
+     */
+    function requestRefund(PurchaseData calldata purchaseData, string memory reason)
+        external
+        returns (uint256 requestId)
+    {
+        PurchaseData memory data = purchaseData;
+        uint256 index = data.collectionId - 1;
+        Collection storage collection = s_collections[data.seller][index];
+
+        Product storage product = collection.products[data.productId];
+
+        if (product.owner != msg.sender) {
+            revert MarketPlace__YouAreNotProductOwner();
+        }
+
+        s_refundRequestCounter++;
+        s_userRefundRequestsMap[msg.sender][s_refundRequestCounter] = RefundRequest({
+            requestId: s_refundRequestCounter,
+            buyer: msg.sender,
+            seller: data.seller,
+            collectionId: data.collectionId,
+            productId: data.productId,
+            reason: reason,
+            isApproved: false,
+            timestamp: block.timestamp
+        });
+
+        emit RefundRequested(msg.sender, data.seller, data.collectionId, data.productId);
+
+        return requestId = s_refundRequestCounter;
+    }
+
+    /**
+     * @notice Submits a review for a product
+     * @dev The caller must have purchased the product, and the rating must be between 1 and 5
+     * @param seller The address of the seller
+     * @param collectionId The ID of the collection
+     * @param productId The ID of the product
+     * @param rating The rating given by the buyer (1-5)
+     * @param comment The comment provided by the buyer
+     */
+    function submitReview(
+        address seller,
+        uint256 collectionId,
+        uint256 productId,
+        uint256 rating,
+        string memory comment
+    ) external {
+        if (rating < 1 || rating > 5) {
+            revert MarketPlace__RatingMustBeBetween_1_And_5();
+        }
+
+        if (!s_productBuyersMap[seller][collectionId][productId][msg.sender]) {
+            revert MarketPlace__MustPurchaseTheProductFirst();
+        }
+
+        s_productReviews[seller][collectionId][productId].push(
+            Review({reviewer: msg.sender, rating: rating, comment: comment, timestamp: block.timestamp})
+        );
+
+        s_productStats[seller][collectionId][productId].totalRatings += rating;
+        s_productStats[seller][collectionId][productId].averageRating = s_productStats[seller][collectionId][productId]
+            .totalRatings / s_productReviews[seller][collectionId][productId].length;
+
+        emit ReviewSubmitted(msg.sender, seller, collectionId, productId, rating, comment);
+    }
+
+    /**
+     * @notice Creates a support ticket
+     * @dev The ticket is created with a unique ID and stored in the user's ticket list
+     * @param title The title of the support ticket
+     * @param description The description of the support ticket
+     * @param emailAddress The email address of the user
+     */
+    function createSupportTicket(string memory title, string memory description, string memory emailAddress)
+        external
+        returns (uint256 ticketId)
+    {
+        s_ticketCounter++;
+        s_userTickets[msg.sender].push(
+            SupportTicket({
+                ticketId: s_ticketCounter,
+                user: msg.sender,
+                title: title,
+                description: description,
+                emailAddress: emailAddress,
+                isClosed: false,
+                timestamp: block.timestamp
+            })
+        );
+
+        s_userTicketsMap[msg.sender][s_ticketCounter] = SupportTicket({
+            ticketId: s_ticketCounter,
+            user: msg.sender,
+            title: title,
+            description: description,
+            emailAddress: emailAddress,
+            isClosed: false,
+            timestamp: block.timestamp
+        });
+
+        emit SupportTicketCreated(msg.sender, block.timestamp, s_ticketCounter);
+
+        return ticketId = s_ticketCounter;
+    }
+
+    /**
+     * @notice Closes a support ticket
+     * @dev The ticket must exist and not already be closed
+     * @param ticketId The ID of the ticket to close
+     */
+    function closeSupportTicket(uint256 ticketId) external {
+        SupportTicket storage ticket = s_userTicketsMap[msg.sender][ticketId];
+
+        if (ticket.ticketId == 0) {
+            revert MarketPlace__TicketNotFound();
+        }
+
+        emit SupportTicketClosed(ticketId);
+        ticket.isClosed = true;
+    }
+
+    /**
+     * @notice Sends a notification to a user
+     * @dev The notification is stored in the user's notification list
+     * @param user The address of the user
+     * @param message The message to send
+     */
+    function sendNotification(address user, string memory message) external returns (uint256 notificationId) {
+        s_notificationCounter++;
+        s_userNotifications[user].push(
+            Notification({
+                sender: msg.sender,
+                receiver: user,
+                notificationId: s_notificationCounter,
+                message: message,
+                timestamp: block.timestamp
+            })
+        );
+        emit NotificationSent(msg.sender, user);
+
+        return notificationId = s_notificationCounter;
+    }
+
+    /*////////////////////////////////////////////////////
+                    EXTERNAL WITHDRAW FUNCTIONS
+    ////////////////////////////////////////////////////*/
+
+    /**
+     * @dev Withdraw ETH funds from the contract
+     * @notice Only users with pending withdrawals can call this function
+     */
+    function withdraw() external nonReentrant {
+        uint256 amount = s_pendingWithdrawals[msg.sender];
+
+        if (amount == 0) {
+            revert MarketPlace__NoFundsToWithdraw();
+        }
+
+        delete s_pendingWithdrawals[msg.sender];
+        emit FundsWithdrawn(msg.sender, amount);
+        (bool success,) = payable(msg.sender).call{value: amount}("");
+        require(success, "Transfer failed");
+    }
+
+    /**
+     * @dev Withdraws earned seller funds after lockup period
+     * @notice Only callable by valid sellers
+     */
+    function withdrawEarnedAmount() external onlyValidSellers nonReentrant {
+        uint256 earnedAmount = s_soldItems[msg.sender].earnedValue;
+
+        if (earnedAmount == 0) {
+            revert MarketPlace__NoFundsToWithdraw();
+        }
+
+        if (block.timestamp < s_soldItems[msg.sender].lockUpTime) {
+            revert Marketplace__LockUpTimeNotReached();
+        }
+
+        delete s_soldItems[msg.sender].earnedValue;
+        emit FundsWithdrawn(msg.sender, earnedAmount);
+        (bool success,) = payable(msg.sender).call{value: earnedAmount}("");
+        require(success, "Transfer failed");
+    }
+
+    /**
+     * @notice Withdraws a bid refund in ETH
+     * @dev The caller must have a pending refund to withdraw
+     */
+    function withdrawBidRefund() external nonReentrant {
+        uint256 amount = s_pendingBidRefunds[msg.sender];
+        if (amount == 0) {
+            revert MarketPlace__NoFundsToWithdraw();
+        }
+
+        delete s_pendingBidRefunds[msg.sender];
+        emit BidRefunded(msg.sender, amount);
+        (bool success,) = payable(msg.sender).call{value: amount}("");
+        require(success, "Transfer failed");
+    }
+
+    /*////////////////////////////////////////////////////
+                    PUBLIC FUNCTIONS
+    ////////////////////////////////////////////////////*/
+    /**
+     * @dev Grant admin privileges to an address
+     * @param admin Address to elevate to admin
+     * @notice Restricted to contract owner
+     */
+    function grantAdminRole(address admin) public onlyOwner {
+        _grantRole(ADMIN_ROLE, admin);
+        emit AdminRoleGrant(admin);
+    }
+
+    function setNewPremiumUserDiscountPercentage(uint256 newPercentage) public onlyOwner {
+        s_premiumUsersDiscountPercentage = newPercentage;
+    }
+
+    /**
+     * @dev Set a new subscription fee for sellers
+     * @param newChargeAmount New fee to set
+     * @notice Only the owner can call this function
+     */
+    function setSellerSubscriptionFee(uint256 newChargeAmount) public onlyOwner {
+        s_sellerSubscriptionCharge = newChargeAmount;
+        emit SellerSubscriptionFeeChanged(newChargeAmount);
+    }
+
+    /**
+     * @dev Set a new premium subscription fee for users
+     * @param newFee New fee to set
+     * @notice Only the owner can call this function
+     */
+    function setPremiumSubscriptionFee(uint256 newFee) public onlyOwner {
+        s_premiumSubscriptionFee = newFee;
+        emit PremiumSubscriptionFeeChanged(newFee);
+    }
+
+    /**
+     * @dev Set a new platform percentage fee
+     * @param newPercentage New percentage to set
+     * @notice Only the owner can call this function
+     */
+    function setNewPlatformPercentage(uint256 newPercentage) public onlyOwner {
+        s_platformPercentage = newPercentage;
+        emit PlatformPercentageChanged(newPercentage);
+    }
+
+    /**
+     * @dev Set a new ETH value for collecting loyalty points
+     * @param newValue New ETH value to set
+     * @notice Only the owner can call this function.
+     */
+    function setNewEthValueToPoint(uint256 newValue) public onlyOwner {
+        s_ethValueToPoint = newValue;
+    }
+
+    /**
+     * @dev Set new required loyalty points for discounts
+     * @param _new New required points to set
+     * @notice Only the owner can call this function.
+     */
+    function setNewRequiredDiscountPoints(uint256 _new) public onlyOwner {
+        s_requiredDiscountPoints = _new;
+    }
+
+    function setNewLoyalCostumerDiscountPercentage(uint256 newPercentage) public onlyOwner {
+        s_loyalCustomerDiscountPercentage = newPercentage;
+    }
+
+    /**
+     * @dev Change the status of a seller (inactivate, activate, or suspend)
+     * @param inactivate Boolean to inactivate the seller
+     * @param activate Boolean to activate the seller
+     * @param suspend Boolean to suspend the seller
+     * @param seller Address of the seller
+     * @notice Only an admin can call this function
+     */
+    function changeSellerStatus(bool inactivate, bool activate, bool suspend, address seller)
+        public
+        onlyRole(ADMIN_ROLE)
+    {
+        if (s_sellers[seller].seller != seller) {
+            revert MarketPlace__SellerNotFound();
+        }
+
+        if (inactivate) {
+            emit AdminInactivatedSeller(seller);
+            s_sellerStatus[seller] = SellerStatus.INACTIVE;
+        }
+
+        if (activate) {
+            emit AdminActivatedSeller(seller);
+            s_sellerStatus[seller] = SellerStatus.ACTIVE;
+        }
+
+        if (suspend) {
+            emit AdminSuspendedSeller(seller);
+            s_sellerStatus[seller] = SellerStatus.SUSPENDED;
+            delete s_collections[msg.sender];
+        }
+    }
+
+    function finalizeAuctionByAdmin(PurchaseData calldata data) public onlyRole(ADMIN_ROLE) {
+        finalizeAuction(data);
+    }
+
+    /**
+     * @dev Process a refund request
+     * @param refundData RefundData struct containing refund data
+     * @param approve Boolean indicating whether the refund is approved
+     * @notice Only an admin can call this function
+     */
+    function processRefund(RefundData calldata refundData, bool approve) public onlyRole(ADMIN_ROLE) {
+        RefundData memory data = refundData;
+
+        RefundRequest storage request = s_userRefundRequestsMap[data.buyer][data.requestId];
+
+        Collection storage collection = s_collections[data.seller][data.collectionId - 1];
+
+        Product storage product = collection.products[data.productId];
+
+        if (approve) {
+            emit RefundApproved(data.buyer, data.requestId);
+            request.isApproved = approve;
+            product.owner = data.seller;
+
+            (bool success,) = payable(data.buyer).call{value: data.value}("");
+            require(success);
+        } else {
+            emit RefundRejected(data.buyer, data.requestId);
+        }
+    }
+
+    /**
+     * @dev Finalizes completed auction
+     * @param purchaseData PurchaseData struct containing auction details
+     * @notice Auction must be ended and have bids
+     * @notice Uses nonReentrant modifier
+     */
+    function finalizeAuction(PurchaseData calldata purchaseData) public nonReentrant {
+        PurchaseData memory data = purchaseData;
+        Auction storage auction = s_auctions[data.seller][data.collectionId][data.productId];
+
+        if (block.timestamp <= auction.startTime + auction.duration) {
+            revert MarketPlace__AuctionStillActive();
+        }
+
+        if (auction.highestBidder == address(0)) {
+            revert MarketPlace__NoBidsPlaced();
+        }
+
+        if (auction.finalized) {
+            revert Marketplace__ActionAlreadyFinalized();
+        }
+
+        auction.finalized = true;
+
+        uint256 initialGas = gasleft();
+
+        (bool success,) = auction.seller.call{value: auction.highestBid}("");
+        require(success, "Transfer failed");
+
+        Collection storage collection = s_collections[data.seller][data.collectionId - 1];
+        Product storage product = collection.products[data.productId];
+
+        product.owner = auction.highestBidder;
+
+        s_userTransactions[msg.sender].push(
+            Transaction({
+                buyer: auction.highestBidder,
+                seller: data.seller,
+                collectionId: data.collectionId,
+                productId: data.productId,
+                value: auction.highestBid,
+                timestamp: block.timestamp
+            })
+        );
+
+        uint256 gasUsed = initialGas - gasleft();
+        uint256 gasCost = gasUsed * tx.gasprice;
+
+        (bool rewardSuccess,) = msg.sender.call{value: gasCost}("");
+        require(rewardSuccess, "Gas reward transfer failed");
+
+        delete s_activeAuctions[data.seller][data.collectionId][data.productId];
+
+        emit AuctionFinalized(data.seller, data.collectionId, data.productId, auction.highestBidder, auction.highestBid);
+    }
+
+    /*////////////////////////////////////////////////////
+                        INTERNAL FUNCTIONS
+    ////////////////////////////////////////////////////*/
+
+    /**
+     * @dev Internal function to update sales data after purchase
+     * @param info PurchaseInfo struct containing purchase details
+     */
+    function _updateSalesData(PurchaseInfo memory info) internal {
+        uint256 index = info.collectionId - 1;
+        Collection storage collection = s_collections[info.seller][index];
+        Product storage product = collection.products[info.productId];
+
+        uint256 platformFee = (info.price * s_platformPercentage) / PRECISION;
+        s_platformRevenue += platformFee;
+
+        uint256 sellerEarn = info.price - platformFee;
+
+        s_soldItems[info.seller] = SoldItems({
+            seller: info.seller,
+            earnedValue: sellerEarn,
+            soldTime: block.timestamp,
+            lockUpTime: block.timestamp + SELLER_SOLD_ITEM_LOCKUP
+        });
+
+        product.owner = msg.sender;
+
+        s_sellerEarnings[info.seller] += sellerEarn;
+        s_productSales[info.productId]++;
+        s_productStats[info.seller][info.collectionId][info.productId].totalSold++;
+        s_productStats[info.seller][info.collectionId][info.productId].totalRevenue += info.price;
+    }
+
+    /**
+     * @dev Internal function to save transaction record
+     * @param info PurchaseInfo struct containing purchase details
+     */
+    function _saveTransaction(PurchaseInfo memory info) internal {
+        s_productBuyers[info.seller][info.collectionId][info.productId].push(msg.sender);
+        s_userTransactions[msg.sender].push(
+            Transaction({
+                buyer: msg.sender,
+                seller: info.seller,
+                collectionId: info.collectionId,
+                productId: info.productId,
+                value: info.price,
+                timestamp: block.timestamp
+            })
+        );
+    }
+
+    /**
+     * @dev Internal function to mark product as bought by user
+     * @param info PurchaseInfo struct containing purchase details
+     */
+    function _markProductAsBought(PurchaseInfo memory info) internal {
+        s_productBuyersMap[info.seller][info.collectionId][info.productId][msg.sender] = true;
+    }
+
+    /**
+     * @dev Internal function to add loyalty points
+     * @param user Address to add points to
+     * @param purchaseAmount Purchase amount in wei
+     */
+    function _addLoyaltyPoints(address user, uint256 purchaseAmount) internal {
+        uint256 points = purchaseAmount / s_ethValueToPoint;
+
+        s_loyaltyRewards[user].points += points;
+        s_loyaltyRewards[user].lastPurchaseTimestamp = block.timestamp;
+        emit LoyaltyPointsAdded(user, points);
+    }
+
+    /**
+     * @dev Authorizes contract upgrades
+     * @param newImplementation Address of the new implementation contract
+     * @notice Only callable by the owner
+     */
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
+
+    /**
+     * @notice Applies a discount coupon to a product
+     * @dev The coupon must not be expired or already used
+     * @param seller The address of the seller
+     * @param collectionId The ID of the collection
+     * @param productId The ID of the product
+     * @param couponId The ID of the coupon
+     */
+    function _applyCouponDiscount(address seller, uint256 collectionId, uint256 productId, uint256 couponId) internal {
+        uint256 index = collectionId - 1;
+        Collection storage collection = s_collections[seller][index];
+        Product storage product = collection.products[productId];
+
+        DiscountCoupon storage coupon = s_discountCoupons[couponId];
+        if (coupon.isUsed) revert MarketPlace__CouponAlreadyUsed();
+        if (block.timestamp > coupon.expirationTime) revert MarketPlace__CouponExpired();
+
+        uint256 currentPrice = product.discountedPrice != 0 ? product.discountedPrice : product.price;
+        uint256 discountAmount = (currentPrice * coupon.discountPercentage) / PRECISION;
+        product.discountedPrice = currentPrice - discountAmount;
+
+        coupon.isUsed = true;
+        emit DiscountCouponApplied(seller, collectionId, productId, couponId);
+    }
+
+    function _applyLoyaltyDiscount(address seller, uint256 collectionId, uint256 productId, address user) internal {
+        uint256 index = collectionId - 1;
+        Collection storage collection = s_collections[seller][index];
+        Product storage product = collection.products[productId];
+
+        if (s_loyaltyRewards[user].points >= s_requiredDiscountPoints) {
+            uint256 currentPrice = product.discountedPrice != 0 ? product.discountedPrice : product.price;
+            uint256 discountAmount = (currentPrice * s_loyalCustomerDiscountPercentage) / PRECISION;
+            product.discountedPrice = currentPrice - discountAmount;
+            s_loyaltyRewards[user].points -= s_requiredDiscountPoints;
+            emit LoyaltyDiscountApplied(user, discountAmount);
+        }
+    }
+
+    /**
+     * @notice Calculates the average rating of a product
+     * @dev The average is calculated based on all reviews submitted for the product
+     * @param seller The address of the seller
+     * @param collectionId The ID of the collection
+     * @param productId The ID of the product
+     * @return The average rating of the product
+     */
+    function _calculateAverageRating(address seller, uint256 collectionId, uint256 productId)
+        internal
+        view
+        returns (uint256)
+    {
+        Review[] memory reviews = s_productReviews[seller][collectionId][productId];
+        if (reviews.length == 0) {
+            return 0;
+        }
+
+        uint256 totalRating = 0;
+        for (uint256 i = 0; i < reviews.length; i++) {
+            totalRating += reviews[i].rating;
+        }
+
+        return totalRating / reviews.length;
+    }
+
+    /*////////////////////////////////////////////////////
+                        GETTER FUNCTIONS
+    ////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Retrieves the top rated products of a specific seller
+     * @param seller The address of the seller
+     */
+    function getTopRatedProducts(address seller) external view returns (Product[] memory) {
+        uint256 totalProducts = 0;
+
+        for (uint256 i = 0; i < s_collections[seller].length; i++) {
+            totalProducts += s_collections[seller][i].productCount;
+        }
+
+        Product[] memory products = new Product[](totalProducts);
+        uint256[] memory averageRatings = new uint256[](totalProducts);
+        uint256 index = 0;
+
+        for (uint256 i = 0; i < s_collections[seller].length; i++) {
+            Collection storage collection = s_collections[seller][i];
+            for (uint256 j = 1; j <= collection.productCount; j++) {
+                products[index] = collection.products[j];
+                averageRatings[index] = _calculateAverageRating(seller, collection.collectionId, j);
+                index++;
+            }
+        }
+
+        for (uint256 i = 0; i < totalProducts - 1; i++) {
+            for (uint256 j = i + 1; j < totalProducts; j++) {
+                if (averageRatings[i] < averageRatings[j]) {
+                    (products[i], products[j]) = (products[j], products[i]);
+                    (averageRatings[i], averageRatings[j]) = (averageRatings[j], averageRatings[i]);
+                }
+            }
+        }
+
+        uint256 resultCount = totalProducts > 10 ? 10 : totalProducts;
+        Product[] memory topRatedProducts = new Product[](resultCount);
+        for (uint256 i = 0; i < resultCount; i++) {
+            topRatedProducts[i] = products[i];
+        }
+
+        return topRatedProducts;
+    }
+
+    /**
+     * @notice Retrieves the top selling products of a specific seller
+     * @param seller The address of the seller
+     */
+    function getTopSellingProducts(address seller) external view returns (Product[] memory) {
+        uint256 totalProducts = 0;
+
+        for (uint256 i = 0; i < s_collections[seller].length; i++) {
+            totalProducts += s_collections[seller][i].productCount;
+        }
+
+        Product[] memory products = new Product[](totalProducts);
+        uint256[] memory sales = new uint256[](totalProducts);
+        uint256 index = 0;
+
+        for (uint256 i = 0; i < s_collections[seller].length; i++) {
+            Collection storage collection = s_collections[seller][i];
+            for (uint256 j = 1; j <= collection.productCount; j++) {
+                products[index] = collection.products[j];
+                sales[index] = s_productSales[collection.products[j].productId];
+                index++;
+            }
+        }
+
+        for (uint256 i = 0; i < totalProducts - 1; i++) {
+            for (uint256 j = i + 1; j < totalProducts; j++) {
+                if (sales[i] < sales[j]) {
+                    (products[i], products[j]) = (products[j], products[i]);
+                    (sales[i], sales[j]) = (sales[j], sales[i]);
+                }
+            }
+        }
+
+        uint256 resultCount = totalProducts > 10 ? 10 : totalProducts;
+        Product[] memory topProducts = new Product[](resultCount);
+        for (uint256 i = 0; i < resultCount; i++) {
+            topProducts[i] = products[i];
+        }
+
+        return topProducts;
+    }
+
+    /**
+     * @notice Retrieves the average rating of a specific product
+     * @param seller The address of the seller
+     * @param collectionId The ID of the collection
+     * @param productId The ID of the product
+     * @return uint256 The average rating of the product
+     */
+    function getProductAverageRating(address seller, uint256 collectionId, uint256 productId)
+        external
+        view
+        returns (uint256)
+    {
+        return s_productStats[seller][collectionId][productId].averageRating;
+    }
+
+    function getAdminRole() external pure returns (bytes32) {
+        return ADMIN_ROLE;
+    }
+
+    function getOwner() external view returns (address) {
+        return owner();
+    }
+
+    function isVerifiedSeller(address seller) external view returns (bool) {
+        return s_sellerIdentity.isSellerVerified(seller);
+    }
+
+    function getSubscriptionCancellationDeadline() external pure returns (uint256) {
+        return SUB_CANCELLATION_DEADLINE;
+    }
+
+    function getSellerId(address _address) external view returns (uint256) {
+        return s_sellers[_address].id;
+    }
+
+    function getPremiumUsersDiscount(uint256 price) external view returns (uint256) {
+        uint256 premiumDiscount = (price * s_premiumUsersDiscountPercentage) / PRECISION;
+        return premiumDiscount;
+    }
+
+    function getPremiumDiscountUserPercentage() external view returns (uint256) {
+        return s_premiumUsersDiscountPercentage;
+    }
+
+    function getSellersSubscriptionCharge() external view returns (uint256) {
+        return s_sellerSubscriptionCharge;
+    }
+
+    function getPremiumSubscriptionFee() external view returns (uint256) {
+        return s_premiumSubscriptionFee;
+    }
+
+    function getPlatformPercentage() external view returns (uint256) {
+        return s_platformPercentage;
+    }
+
+    function getEthValueToPoint() external view returns (uint256) {
+        return s_ethValueToPoint;
+    }
+
+    function getRequiredDiscountPoints() external view returns (uint256) {
+        return s_requiredDiscountPoints;
+    }
+
+    function getSellerStatus(address seller) external view returns (SellerStatus) {
+        return s_sellerStatus[seller];
+    }
+
+    function getSellersInfo(address _address) external view returns (Seller memory) {
+        return s_sellers[_address];
+    }
+
+    function getSellersSubEndTime() external pure returns (uint256) {
+        return SELLER_END_SUB;
+    }
+
+    function getTotalSellers() external view returns (uint256) {
+        return s_sellerId;
+    }
+
+    function getCategoryProducts(address seller, uint256 categoryId) external view returns (uint256[] memory) {
+        Category storage category = s_userCategoriesMap[seller][categoryId];
+        if (category.categoryId == 0) {
+            revert MarketPlace__CategoryNotFound();
+        }
+
+        return category.productIds;
+    }
+
+    function getSellerCategoryByCategoryId(address seller, uint256 id) external view returns (Category memory) {
+        return s_userCategoriesMap[seller][id];
+    }
+
+    function getSellerCategories(address seller) external view returns (Category[] memory) {
+        return s_userCategories[seller];
+    }
+
+    function getTotalCreatedCategories() external view returns (uint256) {
+        return s_categoryCounter;
+    }
+
+    function getCollection(address seller, uint256 collectionId)
+        external
+        view
+        onlyExistCollection(seller, collectionId)
+        returns (address owner, uint256 id, string memory name, string memory description, uint256 productCount)
+    {
+        Collection storage collection = s_collections[seller][collectionId - 1];
+        return (
+            collection.owner,
+            collection.collectionId,
+            collection.collectionName,
+            collection.collectionDescription,
+            collection.productCount
+        );
+    }
+
+    function getSellerTotalCollections(address seller) external view returns (uint256) {
+        return s_collections[seller].length;
+    }
+
+    function getSellerTimestamp(address seller) external view returns (uint256) {
+        return s_sellers[seller].subTimestamp;
+    }
+
+    function getProducts(address seller, uint256 collectionId) external view returns (Product[] memory) {
+        Collection storage collection = s_collections[seller][collectionId - 1];
+        Product[] memory products = new Product[](collection.productCount);
+
+        for (uint256 i = 1; i <= collection.productCount; i++) {
+            products[i - 1] = collection.products[i];
+        }
+
+        return products;
+    }
+
+    function getProduct(address seller, uint256 collectionId, uint256 productId)
+        external
+        view
+        returns (
+            uint256 price,
+            string memory productDescription,
+            bool soldOut,
+            uint256 couponId,
+            uint256 discountedPrice,
+            bool forPremiums,
+            address owner
+        )
+    {
+        Collection storage collection = s_collections[seller][collectionId - 1];
+        Product storage product = collection.products[productId];
+
+        return (
+            product.price,
+            product.productDescription,
+            product.soldOut,
+            product.couponId,
+            product.discountedPrice,
+            product.forPremiums,
+            product.owner
+        );
+    }
+
+    function getDiscountCoupon(uint256 couponId)
+        external
+        view
+        returns (uint256 discountPercentage, uint256 expirationTime, bool isUsed)
+    {
+        DiscountCoupon storage coupon = s_discountCoupons[couponId];
+        return (coupon.discountPercentage, coupon.expirationTime, coupon.isUsed);
+    }
+
+    function getCouponIdDetails(uint256 couponId) external view returns (DiscountCoupon memory) {
+        return s_discountCoupons[couponId];
+    }
+
+    function getTotalDiscountCoupons() external view returns (uint256) {
+        return s_couponCounter;
+    }
+
+    function getSellerPendingWithdrawls(address seller) external view returns (uint256) {
+        return s_pendingWithdrawals[seller];
+    }
+
+    function getActiveAuctions(address seller, uint256 collectionId) external view returns (Auction[] memory) {
+        Collection storage collection = s_collections[seller][collectionId - 1];
+        Auction[] memory activeAuctions = new Auction[](collection.productCount);
+        console.log("product count: ", collection.productCount);
+
+        uint256 count = 0;
+
+        for (uint256 i = 1; i <= collection.productCount; i++) {
+            if (s_activeAuctions[seller][collectionId][i]) {
+                activeAuctions[count] = s_auctions[seller][collectionId][i];
+                count++;
+                console.log("count :", count);
+            }
+        }
+
+        Auction[] memory result = new Auction[](count);
+
+        for (uint256 i = 0; i < count; i++) {
+            result[i] = activeAuctions[i];
+        }
+
+        return result;
+    }
+
+    function getMaxAuctionDuration() external pure returns (uint256) {
+        return MAX_AUCTION_DURATION;
+    }
+
+    function isPremiumUser(address user) external view returns (bool) {
+        return s_premiumSubscriptions[user].endTimestamp > block.timestamp;
+    }
+
+    function getPremiumUsersDetails(address user) external view returns (PremiumSubscription memory) {
+        return s_premiumSubscriptions[user];
+    }
+
+    function getPremiumSubscriptionDeadline() external pure returns (uint256) {
+        return PREMIUM_SUBSCRIPTION_END;
+    }
+
+    function hasPurchasedProductId(address seller, uint256 collectionId, uint256 productId, address user)
+        external
+        view
+        returns (bool)
+    {
+        return s_productBuyersMap[seller][collectionId][productId][user];
+    }
+
+    function calculatePlatformFee(uint256 price) external view returns (uint256) {
+        uint256 platformFee = (price * s_platformPercentage) / PRECISION;
+
+        return platformFee;
+    }
+
+    function getPlatformRevenue() external view returns (uint256) {
+        return s_platformRevenue;
+    }
+
+    function getSellerEarnings(address seller) external view returns (uint256) {
+        return s_sellerEarnings[seller];
+    }
+
+    function getProductSalesByProductId(uint256 productId) external view returns (uint256) {
+        return s_productSales[productId];
+    }
+
+    function getProductStats(address seller, uint256 collectionId, uint256 productId)
+        external
+        view
+        returns (uint256 totalSold, uint256 totalRevenue, uint256 totalRatings, uint256 averageRating)
+    {
+        ProductStats storage productStats = s_productStats[seller][collectionId][productId];
+        return
+            (productStats.totalSold, productStats.totalRevenue, productStats.totalRatings, productStats.averageRating);
+    }
+
+    function getProductBuyers(address seller, uint256 collectionId, uint256 productId)
+        external
+        view
+        returns (address[] memory)
+    {
+        return s_productBuyers[seller][collectionId][productId];
+    }
+
+    function getTransactionHistory(address user) external view returns (Transaction[] memory) {
+        return s_userTransactions[user];
+    }
+
+    function getLoyaltyPoints(address user) external view returns (uint256) {
+        return s_loyaltyRewards[user].points;
+    }
+
+    function getUserPendingBidRefund(address _address) external view returns (uint256) {
+        return s_pendingBidRefunds[_address];
+    }
+
+    function getAuction(address seller, uint256 collectionId, uint256 productId)
+        external
+        view
+        returns (Auction memory)
+    {
+        return s_auctions[seller][collectionId][productId];
+    }
+
+    function getUserRefundRequests(address user, uint256 requestId) external view returns (RefundRequest memory) {
+        return s_userRefundRequestsMap[user][requestId];
+    }
+
+    function getTotalRefundRequests() external view returns (uint256) {
+        return s_refundRequestCounter;
+    }
+
+    function getLoyalCostumerDiscountPercentage() external view returns (uint256) {
+        return s_loyalCustomerDiscountPercentage;
+    }
+
+    function getProductReviews(address seller, uint256 collectionId, uint256 productId)
+        external
+        view
+        returns (Review[] memory)
+    {
+        return s_productReviews[seller][collectionId][productId];
+    }
+
+    function getUserTickets(address user) external view returns (SupportTicket[] memory) {
+        return s_userTickets[user];
+    }
+
+    function getUserTicket(address user, uint256 ticketId) external view returns (SupportTicket memory) {
+        return s_userTicketsMap[user][ticketId];
+    }
+
+    function getTotalNumberOfTickets() external view returns (uint256) {
+        return s_ticketCounter;
+    }
+
+    function getUserNotifications(address user) external view returns (Notification[] memory) {
+        return s_userNotifications[user];
+    }
+
+    function getTotalSentNotifications() external view returns (uint256) {
+        return s_notificationCounter;
+    }
+}
