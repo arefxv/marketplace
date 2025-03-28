@@ -78,7 +78,7 @@ contract MarketPlace is
     /**
      * @dev Represents a product listed in the marketplace
      * @param productId Unique identifier for the product
-     * @param price Price of the product in USD
+     * @param price Price of the product in ETH
      * @param productDescription Description or metadata of the product
      * @param soldOut Boolean indicating if the product is sold out
      * @param couponId ID of the active discount coupon for this product
